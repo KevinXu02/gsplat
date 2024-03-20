@@ -8,6 +8,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 import gsplat.cuda as _C
+
 from .utils import bin_and_sort_gaussians, compute_cumulative_intersects
 
 
@@ -22,7 +23,7 @@ def rasterize_gaussians(
     img_height: int,
     img_width: int,
     block_width: int,
-    background: Optional[Float[Tensor, "channels"]] = None,
+    background: Optional[Float[Tensor, "*batch channels"]] = None,
     return_alpha: Optional[bool] = False,
 ) -> Tensor:
     """Rasterizes 2D gaussians by sorting and binning gaussian intersections for each tile and returns an N-dimensional output using alpha-compositing.
@@ -56,13 +57,15 @@ def rasterize_gaussians(
         colors = colors.float() / 255
 
     if background is not None:
-        assert (
-            background.shape[0] == colors.shape[-1]
-        ), f"incorrect shape of background color tensor, expected shape {colors.shape[-1]}"
+        # assert (
+        #     background.shape[0] == colors.shape[-1]
+        # ), f"incorrect shape of background color tensor, expected shape {colors.shape[-1]}"
+        # make sure background is a 2d image
+        # print("background shape", background.shape)
+        if background.ndimension() == 1:
+            background = background.unsqueeze(0)
     else:
-        background = torch.ones(
-            colors.shape[-1], dtype=torch.float32, device=colors.device
-        )
+        background = torch.ones(colors.shape[-1], dtype=torch.float32, device=colors.device)
 
     if xys.ndimension() != 2 or xys.size(1) != 2:
         raise ValueError("xys must have dimensions (N, 2)")
@@ -102,7 +105,7 @@ class _RasterizeGaussians(Function):
         img_height: int,
         img_width: int,
         block_width: int,
-        background: Optional[Float[Tensor, "channels"]] = None,
+        background: Optional[Float[Tensor, "*batch channels"]] = None,
         return_alpha: Optional[bool] = False,
     ) -> Tensor:
         num_points = xys.size(0)
@@ -117,10 +120,7 @@ class _RasterizeGaussians(Function):
         num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
 
         if num_intersects < 1:
-            out_img = (
-                torch.ones(img_height, img_width, colors.shape[-1], device=xys.device)
-                * background
-            )
+            out_img = torch.ones(img_height, img_width, colors.shape[-1], device=xys.device) * background
             gaussian_ids_sorted = torch.zeros(0, 1, device=xys.device)
             tile_bins = torch.zeros(0, 2, device=xys.device)
             final_Ts = torch.zeros(img_height, img_width, device=xys.device)
@@ -142,10 +142,12 @@ class _RasterizeGaussians(Function):
                 tile_bounds,
                 block_width,
             )
-            if colors.shape[-1] == 3:
-                rasterize_fn = _C.rasterize_forward
-            else:
-                rasterize_fn = _C.nd_rasterize_forward
+
+            rasterize_fn = _C.rasterize_forward_2d_bg
+            # if colors.shape[-1] == 3:
+            #     rasterize_fn = _C.rasterize_forward_2d_bg
+            # else:
+            #     rasterize_fn = _C.nd_rasterize_forward
 
             out_img, final_Ts, final_idx = rasterize_fn(
                 tile_bounds,
@@ -211,10 +213,10 @@ class _RasterizeGaussians(Function):
 
         else:
             if colors.shape[-1] == 3:
-                rasterize_fn = _C.rasterize_backward
+                rasterize_fn = _C.rasterize_backward_2d_bg
             else:
                 rasterize_fn = _C.nd_rasterize_backward
-            v_xy, v_conic, v_colors, v_opacity = rasterize_fn(
+            v_xy, v_conic, v_colors, v_opacity, v_background = rasterize_fn(
                 img_height,
                 img_width,
                 ctx.block_width,
@@ -242,6 +244,6 @@ class _RasterizeGaussians(Function):
             None,  # img_height
             None,  # img_width
             None,  # block_width
-            None,  # background
+            v_background,  # background
             None,  # return_alpha
         )

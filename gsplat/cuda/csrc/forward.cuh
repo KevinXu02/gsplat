@@ -58,6 +58,22 @@ __global__ void nd_rasterize_forward(
     const float* __restrict__ background
 );
 
+// compute output color image from binned and sorted gaussians
+__global__ void rasterize_forward_2d_bg(
+    const dim3 tile_bounds,
+    const dim3 img_size,
+    const int32_t* __restrict__ gaussian_ids_sorted,
+    const int2* __restrict__ tile_bins,
+    const float2* __restrict__ xys,
+    const float3* __restrict__ conics,
+    const float3* __restrict__ colors,
+    const float* __restrict__ opacities,
+    float* __restrict__ final_Ts,
+    int* __restrict__ final_index,
+    float3* __restrict__ out_img,
+    const float3* __restrict__ background
+);
+
 // device helper to approximate projected 2d cov from 3d mean and cov
 __device__ void project_cov3d_ewa(
     const float3 &mean3d,
