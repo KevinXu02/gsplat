@@ -34,11 +34,11 @@ class Config:
     ckpt: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "D:\Kevin\Documents\Berkeley\\nerf\data\drone"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "results/colmap"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -62,11 +62,11 @@ class Config:
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
-    init_type: str = "sfm"
+    init_type: str = "random"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
+    init_extent: float = 4.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -84,7 +84,7 @@ class Config:
     far_plane: float = 1e10
 
     # Maximum number of GSs.
-    cap_max: int = 1_000_000
+    cap_max: int = 3_000_000
     # MCMC samping noise learning rate
     noise_lr = 5e5
     # Opacity regularization
@@ -106,7 +106,7 @@ class Config:
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
     absgrad: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -265,6 +265,7 @@ class Runner:
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
+            self.server.scene.set_up_direction("-z")
             self.viewer = nerfview.Viewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
@@ -533,7 +534,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()

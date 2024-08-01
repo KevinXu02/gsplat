@@ -33,11 +33,13 @@ class Config:
     ckpt: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = (
+        "D:\Kevin\Documents\Berkeley\\nerf\SplatterImage\\test_data\\table10"
+    )
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "results/table10"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -85,14 +87,14 @@ class Config:
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.005
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0002
+    grow_grad2d: float = 0.0008
     # GSs with scale below this value will be duplicated. Above will be split
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 500
+    refine_start_iter: int = 200
     # Stop refining GSs after this iteration
     refine_stop_iter: int = 15_000
     # Reset opacities every this steps
@@ -105,7 +107,7 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
-    absgrad: bool = False
+    absgrad: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
     # Whether to use revised opacity heuristic from arXiv:2404.06109 (experimental)
@@ -124,7 +126,7 @@ class Config:
     pose_noise: float = 0.0
 
     # Enable appearance optimization. (experimental)
-    app_opt: bool = False
+    app_opt: bool = True
     # Appearance embedding dimension
     app_embed_dim: int = 16
     # Learning rate for appearance optimization
