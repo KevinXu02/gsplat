@@ -15,6 +15,25 @@ from .normalize import (
 )
 
 
+def read_array(path):
+    with open(path, "rb") as fid:
+        width, height, channels = np.genfromtxt(
+            fid, delimiter="&", max_rows=1, usecols=(0, 1, 2), dtype=int
+        )
+        fid.seek(0)
+        num_delimiter = 0
+        byte = fid.read(1)
+        while True:
+            if byte == b"&":
+                num_delimiter += 1
+                if num_delimiter >= 3:
+                    break
+            byte = fid.read(1)
+        array = np.fromfile(fid, np.float32)
+    array = array.reshape((width, height, channels), order="F")
+    return np.transpose(array, (1, 0, 2)).squeeze()
+
+
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []
@@ -142,12 +161,27 @@ class Parser:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
 
+        depth_dir = os.path.join(data_dir, "depths")
+        depth_dir = os.path.join(data_dir, "depths" + image_dir_suffix)
+        if not os.path.exists(depth_dir):
+            print(f"Warning: Depth folder {depth_dir} does not exist.")
+            depth_dir = None
+
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # Load depths.depth name= image_name+.bin
+        if depth_dir is not None:
+            depth_files = sorted(_get_rel_paths(depth_dir))
+            colmap_to_depth = dict(zip(colmap_files, depth_files))
+            depth_paths = [
+                os.path.join(depth_dir, colmap_to_depth[f]) for f in image_names
+            ]
+            print(f"[Parser] {len(depth_paths)} depth maps found.")
+            print("depth_paths", depth_paths)
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -191,6 +225,7 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+        self.depth_paths = depth_paths if depth_dir is not None else None
 
         # undistortion
         self.mapx_dict = dict()
@@ -306,6 +341,15 @@ class Dataset:
             depths = depths[selector]
             data["points"] = torch.from_numpy(points).float()
             data["depths"] = torch.from_numpy(depths).float()
+
+        if self.parser.depth_paths is not None:
+            depth_path = self.parser.depth_paths[index]
+            depth = read_array(depth_path)
+            if self.patch_size is not None:
+                depth = depth[y : y + self.patch_size, x : x + self.patch_size]
+            data["depth"] = torch.from_numpy(depth).float()
+            print(f"depth min={depth.min()}, max={depth.max()}")
+            exit()
 
         return data
 

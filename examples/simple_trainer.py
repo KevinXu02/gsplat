@@ -19,7 +19,14 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+    AppDecoder,
+)
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
@@ -33,13 +40,11 @@ class Config:
     ckpt: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = (
-        "D:\Kevin\Documents\Berkeley\\nerf\SplatterImage\\test_data\\table10"
-    )
+    data_dir: str = "D:\Kevin\Documents\Berkeley\\nerf\data\drone"
     # Downsample factor for the dataset
-    data_factor: int = 1
+    data_factor: int = 2
     # Directory to save results
-    result_dir: str = "results/table10"
+    result_dir: str = "results/drone"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -94,13 +99,13 @@ class Config:
     prune_scale3d: float = 0.1
 
     # Start refining GSs after this iteration
-    refine_start_iter: int = 200
+    refine_start_iter: int = 1000
     # Stop refining GSs after this iteration
     refine_stop_iter: int = 15_000
     # Reset opacities every this steps
     reset_every: int = 3000
     # Refine GSs every this steps
-    refine_every: int = 100
+    refine_every: int = 200
 
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -126,13 +131,17 @@ class Config:
     pose_noise: float = 0.0
 
     # Enable appearance optimization. (experimental)
-    app_opt: bool = True
+    app_opt: bool = False
     # Appearance embedding dimension
     app_embed_dim: int = 16
     # Learning rate for appearance optimization
     app_opt_lr: float = 1e-3
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
+
+    unet: bool = True
+    unet_lr: float = 1e-3
+    unet_reg: float = 1e-6
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
@@ -203,7 +212,7 @@ def create_splats_with_optimizers(
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
+        params.append(("features", torch.nn.Parameter(features), 5e-3))
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
@@ -264,7 +273,7 @@ class Runner:
         print("Scene scale:", self.scene_scale)
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
+        feature_dim = 32 if cfg.app_opt or cfg.unet else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -335,6 +344,15 @@ class Runner:
                     lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
                 ),
             ]
+        if cfg.unet:
+            self.unet_module = AppDecoder(32, 3).to(self.device)
+            self.unet_optimizers = [
+                torch.optim.Adam(
+                    self.unet_module.parameters(),
+                    lr=cfg.unet_lr * math.sqrt(cfg.batch_size),
+                    weight_decay=cfg.unet_reg,
+                )
+            ]
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -346,6 +364,7 @@ class Runner:
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
+            self.server.scene.set_up_direction("-z")
             self.viewer = nerfview.Viewer(
                 server=self.server,
                 render_fn=self._viewer_render_fn,
@@ -377,6 +396,11 @@ class Runner:
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
+        elif self.cfg.unet:
+            # colors = self.splats["features"]
+            # means = self.splats["means"]
+            colors = torch.cat([colors, means], 1)
+            # print(colors)
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
@@ -397,6 +421,12 @@ class Runner:
             rasterize_mode=rasterize_mode,
             **kwargs,
         )
+        if self.cfg.unet:
+            # B H W C -> B C H W
+            render_colors = render_colors.permute(0, 3, 1, 2)
+            render_colors = self.unet_module(render_colors)
+            # print(render_colors[0, 0, 0:5, 0])
+
         return render_colors, render_alphas, info
 
     def train(self):
@@ -470,7 +500,10 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            if cfg.unet:
+                sh_degree_to_use = None
+            else:
+                sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -611,7 +644,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -649,7 +682,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=cfg.sh_degree,
+                sh_degree=None if cfg.unet else cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
             )  # [1, H, W, 3]
@@ -763,7 +796,7 @@ class Runner:
             Ks=K[None],
             width=W,
             height=H,
-            sh_degree=self.cfg.sh_degree,  # active all SH degrees
+            sh_degree=None if self.cfg.unet else self.cfg.sh_degree,
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
