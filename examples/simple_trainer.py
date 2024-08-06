@@ -32,6 +32,84 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
 
 
+def visualize_depth_maps(
+    rendered_depth: torch.Tensor, gt_depth: torch.Tensor, img_fname: str, outdir: str
+) -> str:
+    import matplotlib
+    import cv2
+
+    def normalize_and_colorize(depth_map: np.ndarray) -> np.ndarray:
+        # Normalize the depth map to the range 0-255
+        normalized = (
+            (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min()) * 255.0
+        )
+        normalized = normalized.astype(np.uint8)
+
+        # Get the colormap
+        cmap = matplotlib.colormaps.get_cmap("Spectral_r")
+
+        # Apply the colormap and convert to uint8
+        colorized = (cmap(normalized)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+
+        return colorized
+
+    # Convert torch tensors to numpy arrays
+    rendered_depth_np = rendered_depth.detach().squeeze().cpu().numpy()
+    gt_depth_np = gt_depth.squeeze().cpu().numpy()
+    assert rendered_depth_np.shape == gt_depth_np.shape
+
+    # Colorize both depth maps
+    rendered_visual = normalize_and_colorize(rendered_depth_np)
+    gt_visual = normalize_and_colorize(gt_depth_np)
+
+    # Create a white split region
+    split_region = np.ones((rendered_visual.shape[0], 50, 3), dtype=np.uint8) * 255
+
+    # Combine the rendered depth map, split region, and GT depth map
+    combined_result = cv2.hconcat([rendered_visual, split_region, gt_visual])
+
+    # Add labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1
+    font_color = (255, 255, 255)  # White color
+    line_type = 2
+
+    # Calculate positions for labels
+    img_width = rendered_visual.shape[1]
+    label_y = 30  # Y-coordinate for all labels
+
+    # Add "Rendered Depth" label
+    cv2.putText(
+        combined_result,
+        "Rendered Depth",
+        (img_width // 2 - 75, label_y),
+        font,
+        font_scale,
+        font_color,
+        line_type,
+    )
+
+    # Add "GT Depth" label
+    cv2.putText(
+        combined_result,
+        "GT Depth",
+        (3 * img_width // 2 + 25, label_y),
+        font,
+        font_scale,
+        font_color,
+        line_type,
+    )
+
+    # Save the result to a file
+    output_filename = os.path.join(
+        outdir, f"depth_comparison_{os.path.basename(img_fname)}.png"
+    )
+    cv2.imwrite(output_filename, combined_result)
+    print(f"Depth map visualization saved to {output_filename}")
+
+    return output_filename
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -42,7 +120,7 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "D:\Kevin\Documents\Berkeley\\nerf\data\drone"
     # Downsample factor for the dataset
-    data_factor: int = 2
+    data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/drone"
     # Every N images there is a test image
@@ -139,7 +217,7 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    unet: bool = True
+    unet: bool = False
     unet_lr: float = 1e-3
     unet_reg: float = 1e-6
 
@@ -147,6 +225,8 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    mono_depth: bool = True
+    mono_depth_lambda: float = 0.1
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -353,7 +433,14 @@ class Runner:
                     weight_decay=cfg.unet_reg,
                 )
             ]
-
+        if cfg.mono_depth:
+            # create learnable linear shift scale,bias
+            self.scale = torch.nn.Parameter(
+                torch.ones(len(self.trainset), device=self.device)
+            )
+            self.bias = torch.nn.Parameter(
+                torch.zeros(len(self.trainset), device=self.device)
+            )
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -490,7 +577,9 @@ class Runner:
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
-
+            if cfg.mono_depth:
+                uv = data["uv"].to(device)  # [1, H, W, 2]
+                depths_gt = data["depths"].to(device)  # [H, W]
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
@@ -515,7 +604,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED" if cfg.depth_loss or cfg.mono_depth else "RGB",
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -559,12 +648,55 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.mono_depth:
+                # query depths from depth map
+                grid = uv  # [1, H, W, 2]
+                # print("grid shape", grid.shape)
+
+                # assert depths_gt.shape[0] == 1
+                # print("depths shape", depths.shape)
+                # print("grid shape", grid.shape)
+                # exit()
+                depths = F.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True
+                )  # [1, 1, H, W]
+                assert (
+                    depths.shape[0] == 1 & depths.shape[1] == 1
+                ), f"depths shape: {depths.shape}"
+                print(depths.shape)
+                depths = depths.squeeze(1)  # [1, H, W]
+                # apply linear shift
+                scale, bias = self.scale[image_ids], self.bias[image_ids]
+                depths = scale * depths + bias
+                # visualize depth every 1000 steps
+                if step % 1000 == 0 & step > 0:
+                    visualize_depth_maps(depths, depths_gt, str(step), cfg.result_dir)
+
+                select = (depths_gt > 0) & (depths > 0)
+                disp = torch.where(select, 1 / depths, torch.zeros_like(depths))
+                disp_gt = torch.where(
+                    select, 1 / depths_gt, torch.zeros_like(depths_gt)
+                )
+                mono_depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                loss += mono_depthloss * cfg.mono_depth_lambda
+
+            loss = (
+                loss
+                + cfg.opacity_reg
+                * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+            )
+            loss = (
+                loss
+                + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
+            )
 
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.mono_depth:
+                desc += f"mono depth loss={mono_depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -580,6 +712,10 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.mono_depth:
+                    self.writer.add_scalar(
+                        "train/mono_depthloss", mono_depthloss.item(), step
+                    )
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -796,7 +932,7 @@ class Runner:
             Ks=K[None],
             width=W,
             height=H,
-            sh_degree=None if self.cfg.unet else self.cfg.sh_degree,
+            sh_degree=None if cfg.unet else cfg.sh_degree,
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()

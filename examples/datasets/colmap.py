@@ -175,13 +175,18 @@ class Parser:
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
         # Load depths.depth name= image_name+.bin
         if depth_dir is not None:
-            depth_files = sorted(_get_rel_paths(depth_dir))
-            colmap_to_depth = dict(zip(colmap_files, depth_files))
             depth_paths = [
-                os.path.join(depth_dir, colmap_to_depth[f]) for f in image_names
+                os.path.join(depth_dir, f"{colmap_to_image[f]}.bin")
+                for f in image_names
             ]
             print(f"[Parser] {len(depth_paths)} depth maps found.")
-            print("depth_paths", depth_paths)
+            print("depth_paths", depth_paths[0])
+            # depth = read_array(depth_paths[0])
+            # h, w = depth.shape
+            # print(f"depth shape={depth.shape}")
+            # print(f"depth min={depth.min()}, max={depth.max()}")
+            # exit()
+            # print("depth_paths", depth_paths)
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -344,12 +349,22 @@ class Dataset:
 
         if self.parser.depth_paths is not None:
             depth_path = self.parser.depth_paths[index]
-            depth = read_array(depth_path)
+
+            depth = read_array(depth_path)  # (H, W)
             if self.patch_size is not None:
                 depth = depth[y : y + self.patch_size, x : x + self.patch_size]
-            data["depth"] = torch.from_numpy(depth).float()
-            print(f"depth min={depth.min()}, max={depth.max()}")
-            exit()
+            h, w = depth.shape
+            # create uv grid rescaled in [-1, 1], sample in the center of the pixel
+            x = (torch.arange(w) + 0.5) / w * 2 - 1
+            y = (torch.arange(h) + 0.5) / h * 2 - 1
+            y, x = torch.meshgrid(y, x, indexing="ij")
+            uv = torch.stack([x, y], dim=-1).float()
+            # assert uv.shape == (1, h, w, 2), f"uv shape={uv.shape}"
+            data["uv"] = uv
+            data["depths"] = torch.from_numpy(depth).float()
+            # print(f"depth shape={depth.shape}")
+            # print(f"depth min={depth.min()}, max={depth.max()}")
+            # exit()
 
         return data
 
