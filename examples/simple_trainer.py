@@ -40,13 +40,11 @@ class Config:
     compression: Optional[Literal["png"]] = None
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = (
-        "D:\Kevin\Documents\Berkeley\\nerf\SplatterImage\\test_data\\table10"
-    )
+    data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
-    data_factor: int = 1
+    data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/table10"
+    result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -120,7 +118,7 @@ class Config:
     pose_noise: float = 0.0
 
     # Enable appearance optimization. (experimental)
-    app_opt: bool = True
+    app_opt: bool = False
     # Appearance embedding dimension
     app_embed_dim: int = 16
     # Learning rate for appearance optimization
