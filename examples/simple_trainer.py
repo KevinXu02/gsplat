@@ -51,6 +51,9 @@ def visualize_depth_maps(
         # Apply the colormap and convert to uint8
         colorized = (cmap(normalized)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
 
+        zero_mask = depth_map == 0
+        colorized[zero_mask] = [0, 0, 0]
+
         return colorized
 
     # Convert torch tensors to numpy arrays
@@ -99,13 +102,14 @@ def visualize_depth_maps(
         font_color,
         line_type,
     )
-
+    os.makedirs(os.path.join(outdir, "depth"), exist_ok=True)
     # Save the result to a file
     output_filename = os.path.join(
-        outdir, f"depth_comparison_{os.path.basename(img_fname)}.png"
+        outdir, "depth", f"depth_comparison_{os.path.basename(img_fname)}.png"
     )
     cv2.imwrite(output_filename, combined_result)
     print(f"Depth map visualization saved to {output_filename}")
+    # exit()
 
     return output_filename
 
@@ -122,7 +126,7 @@ class Config:
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/drone"
+    result_dir: str = "results/drone11"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -158,7 +162,7 @@ class Config:
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
-    init_scale: float = 1.0
+    init_scale: float = 10.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
@@ -176,6 +180,9 @@ class Config:
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
 
+    opacity_reg = 0.01
+    # Scale regularization
+    scale_reg = 0.01
     # Start refining GSs after this iteration
     refine_start_iter: int = 1000
     # Stop refining GSs after this iteration
@@ -217,7 +224,7 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    unet: bool = False
+    unet: bool = True
     unet_lr: float = 1e-3
     unet_reg: float = 1e-6
 
@@ -225,7 +232,7 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
-    mono_depth: bool = True
+    mono_depth: bool = False
     mono_depth_lambda: float = 0.1
 
     # Dump information to tensorboard every this steps
@@ -263,7 +270,9 @@ def create_splats_with_optimizers(
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        points = torch.cat([points, torch.from_numpy(parser.points).float()], 0)
         rgbs = torch.rand((init_num_pts, 3))
+        rgbs = torch.cat([rgbs, torch.from_numpy(parser.points_rgb / 255.0).float()], 0)
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
@@ -424,6 +433,7 @@ class Runner:
                     lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
                 ),
             ]
+        self.unet_optimizers = []
         if cfg.unet:
             self.unet_module = AppDecoder(32, 3).to(self.device)
             self.unet_optimizers = [
@@ -433,6 +443,7 @@ class Runner:
                     weight_decay=cfg.unet_reg,
                 )
             ]
+        self.mono_depth_optimizers = []
         if cfg.mono_depth:
             # create learnable linear shift scale,bias
             self.scale = torch.nn.Parameter(
@@ -441,6 +452,13 @@ class Runner:
             self.bias = torch.nn.Parameter(
                 torch.zeros(len(self.trainset), device=self.device)
             )
+            self.mono_depth_optimizers = [
+                torch.optim.Adam(
+                    [self.scale, self.bias],
+                    lr=1e-3 * math.sqrt(cfg.batch_size),
+                    weight_decay=1e-6,
+                )
+            ]
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -484,9 +502,8 @@ class Runner:
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         elif self.cfg.unet:
-            # colors = self.splats["features"]
-            # means = self.splats["means"]
-            colors = torch.cat([colors, means], 1)
+            xyzs_copy = means.detach().clone()
+            colors = torch.cat([self.splats["features"], xyzs_copy], 1)  # [N, K, 3]
             # print(colors)
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
@@ -568,6 +585,7 @@ class Runner:
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            cam_position = camtoworlds[0, :3, 3].detach().to(device)
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
@@ -645,51 +663,82 @@ class Runner:
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                # print("disp min", disp.min())
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
-            if cfg.mono_depth:
+            mono_depthloss = torch.tensor(0.0)
+            if cfg.mono_depth & (step > 2000):
                 # query depths from depth map
                 grid = uv  # [1, H, W, 2]
-                # print("grid shape", grid.shape)
-
-                # assert depths_gt.shape[0] == 1
-                # print("depths shape", depths.shape)
-                # print("grid shape", grid.shape)
-                # exit()
                 depths = F.grid_sample(
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, H, W]
-                assert (
-                    depths.shape[0] == 1 & depths.shape[1] == 1
-                ), f"depths shape: {depths.shape}"
-                print(depths.shape)
                 depths = depths.squeeze(1)  # [1, H, W]
+                # print("depths min", depths.min())
+                # print("depths max", depths.max())
                 # apply linear shift
-                scale, bias = self.scale[image_ids], self.bias[image_ids]
-                depths = scale * depths + bias
-                # visualize depth every 1000 steps
-                if step % 1000 == 0 & step > 0:
-                    visualize_depth_maps(depths, depths_gt, str(step), cfg.result_dir)
-
-                select = (depths_gt > 0) & (depths > 0)
-                disp = torch.where(select, 1 / depths, torch.zeros_like(depths))
-                disp_gt = torch.where(
-                    select, 1 / depths_gt, torch.zeros_like(depths_gt)
+                scale, bias = (
+                    self.scale[image_ids].squeeze(),
+                    self.bias[image_ids].squeeze(),
                 )
+                # print("scale shape", scale.shape)
+                # exit()
+                # get gt depth median
+                # gt_depth_median = torch.median(depths_gt)
+                # apply scale and bias to gt depth where gt depth is not zero and <gt_depth_median
+                # mask = (depths_gt > 0) & (depths_gt < gt_depth_median)
+                # depths_gt = torch.where(
+                #     mask,
+                #     depths_gt * scale[0] + bias[0],
+                #     depths_gt,
+                # )
+                # # apply scale and bias to gt depth >gt_depth_median
+                # depths_gt = torch.where(
+                #     ~mask,
+                #     depths_gt * scale[1] + bias[1],
+                #     depths_gt,
+                # )
+                if step % 1000 == 0:
+                    visualize_depth_maps(
+                        depths.detach(), depths_gt.detach(), str(step), cfg.result_dir
+                    )
+                depths = depths * scale[1] + bias[1]
+                eps = 1e-6  # Small epsilon value
+                depths = torch.clamp(depths, min=eps, max=1e6)
+                depths_gt = torch.clamp(depths_gt, min=eps, max=1e6)
+                select = (
+                    (depths_gt > eps)
+                    & (depths > eps)
+                    & (depths_gt < (depths_gt.max() * 0.1))
+                )
+                disp = torch.where(select, 1 / depths, torch.zeros_like(depths))
+                disp_gt = torch.where(select, depths_gt, torch.zeros_like(depths_gt))
                 mono_depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                # add scale and bias regularization
+                scale_reg = torch.square(scale[1] - 1.0) + torch.abs(bias[1])
+                mono_depthloss += scale_reg * 0.2
                 loss += mono_depthloss * cfg.mono_depth_lambda
 
-            loss = (
-                loss
-                + cfg.opacity_reg
-                * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+            dis2cam = torch.pairwise_distance(
+                self.splats["means"].detach(), cam_position.unsqueeze(0)
             )
-            loss = (
-                loss
-                + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-            )
+            dis2cam = (dis2cam - dis2cam.min()) / (
+                dis2cam.max() - dis2cam.min()
+            ) * 4 + 1
+            # print(dis2cam.shape)
+            # print(self.splats["scales"].shape)
+            # print((1 / dis2cam) * torch.abs(torch.exp(self.splats["scales"])).shape)
+            # exit()
 
+            loss = (
+                loss
+                + cfg.scale_reg
+                * (
+                    (1 / dis2cam)
+                    * torch.abs(torch.exp(self.splats["scales"])).mean(dim=-1)
+                ).mean()
+            )
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -697,6 +746,7 @@ class Runner:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.mono_depth:
                 desc += f"mono depth loss={mono_depthloss.item():.6f}| "
+                # desc += f"scale={scale.item():.6f}| bias={bias.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -753,6 +803,12 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.unet_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.mono_depth_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -818,7 +874,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=None if cfg.unet else cfg.sh_degree,
+                sh_degree=None if self.cfg.unet else self.cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
             )  # [1, H, W, 3]
@@ -932,7 +988,7 @@ class Runner:
             Ks=K[None],
             width=W,
             height=H,
-            sh_degree=None if cfg.unet else cfg.sh_degree,
+            sh_degree=None if self.cfg.unet else self.cfg.sh_degree,
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()

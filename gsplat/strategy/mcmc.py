@@ -54,6 +54,11 @@ class MCMCStrategy(Strategy):
     min_opacity: float = 0.005
     verbose: bool = False
 
+    prune_scale3d: float = 0.1
+    prune_scale2d: float = 0.3
+    scene_scale: float = 12
+    refine_scale2d_stop_iter: int = 0
+
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
         n_max = 51
@@ -61,7 +66,11 @@ class MCMCStrategy(Strategy):
         for n in range(n_max):
             for k in range(n + 1):
                 binoms[n, k] = math.comb(n, k)
-        return {"binoms": binoms}
+        state = {}
+        state["binoms"] = binoms
+        if self.refine_scale2d_stop_iter > 0:
+            state["radii"] = None
+        return state
 
     def check_sanity(
         self,
@@ -115,9 +124,25 @@ class MCMCStrategy(Strategy):
             lr (float): Learning rate for "means" attribute of the GS.
         """
         # move to the correct device
+        for key in ["means2d", "width", "height", "n_cameras", "radii", "gaussian_ids"]:
+            assert key in info, f"{key} is required but missing."
         state["binoms"] = state["binoms"].to(params["means"].device)
-
+        n_gaussian = len(list(params.values())[0])
         binoms = state["binoms"]
+        if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
+            assert "radii" in info, "radii is required but missing."
+            state["radii"] = torch.zeros(n_gaussian, device="cuda")
+
+        sel = info["radii"] > 0.0  # [C, N]
+        gs_ids = torch.where(sel)[1]  # [nnz]
+        radii = info["radii"][sel]  # [nnz]
+        if self.refine_scale2d_stop_iter > 0:
+            # Should be ideally using scatter max
+            state["radii"][gs_ids] = torch.maximum(
+                state["radii"][gs_ids],
+                # normalize radii to [0, 1] screen space
+                radii / float(max(info["width"], info["height"])),
+            )
 
         if (
             step < self.refine_stop_iter
@@ -125,12 +150,12 @@ class MCMCStrategy(Strategy):
             and step % self.refine_every == 0
         ):
             # teleport GSs
-            n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
+            n_relocated_gs = self._relocate_gs(params, optimizers, binoms, step, state)
             if self.verbose:
                 print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
 
             # add new GSs
-            n_new_gs = self._add_new_gs(params, optimizers, binoms)
+            n_new_gs = self._add_new_gs(params, optimizers, binoms, state)
             if self.verbose:
                 print(
                     f"Step {step}: Added {n_new_gs} GSs. "
@@ -150,10 +175,25 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        step: int,
+        state: Dict[str, Any],
     ) -> int:
         opacities = torch.sigmoid(params["opacities"])
         dead_mask = opacities <= self.min_opacity
+        # is_too_big = (
+        #     torch.exp(params["scales"]).max(dim=-1).values
+        #     > self.prune_scale3d * self.scene_scale
+        # )
+        # dead_mask |= is_too_big
+        if step < self.refine_scale2d_stop_iter and step > 3000 and step % 500 == 0:
+            assert state["radii"] is not None
+            screen_size2bigs = state["radii"] > self.prune_scale2d
+            dead_mask |= screen_size2bigs
+            print("screen too bigs", screen_size2bigs.sum().item())
+            # exit()
+
         n_gs = dead_mask.sum().item()
+
         if n_gs > 0:
             relocate(
                 params=params,
@@ -171,6 +211,7 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        state,
     ) -> int:
         current_n_points = len(params["means"])
         n_target = min(self.cap_max, int(1.05 * current_n_points))

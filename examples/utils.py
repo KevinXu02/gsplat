@@ -277,9 +277,9 @@ class AppDecoder(nn.Module):
         super().__init__()
         self.L = 3
         self.pos_enc_dim = 3 * (2 * self.L + 1)
-        self.conv1 = nn.Conv2d(in_channels, 64, 3, padding=1)
-        self.batchnorm1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 32, 3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, padding=1)
+        self.batchnorm1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 32, 3, padding=1)
         self.batchnorm2 = nn.BatchNorm2d(32)
         self.mlp = nn.Sequential(
             nn.Linear(64 + self.pos_enc_dim, 128),
