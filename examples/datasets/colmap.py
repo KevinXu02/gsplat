@@ -13,6 +13,7 @@ from .normalize import (
     transform_cameras,
     transform_points,
 )
+from torch.utils.data import Dataset
 
 
 def _get_rel_paths(path_dir: str) -> List[str]:
@@ -40,6 +41,7 @@ class Parser:
         self.test_every = test_every
 
         colmap_dir = os.path.join(data_dir, "colmap/sparse/0/")
+        pts_map_dir = os.path.join(data_dir, "point_maps")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
@@ -148,6 +150,8 @@ class Parser:
         image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # point map paths
+        point_map_paths = [os.path.join(pts_map_dir, f"{f}.npy") for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -181,15 +185,16 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.point_map_paths = point_map_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.points = points  # np.ndarray, (num_points, 3)
-        self.points_err = points_err  # np.ndarray, (num_points,)
-        self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
-        self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
+        # self.points = points  # np.ndarray, (num_points, 3)
+        # self.points_err = points_err  # np.ndarray, (num_points,)
+        # self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
+        # self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
@@ -237,7 +242,7 @@ class Parser:
         self.scene_scale = np.max(dists)
 
 
-class Dataset:
+class ColmapDataset(Dataset):
     """A simple dataset class."""
 
     def __init__(
@@ -260,67 +265,134 @@ class Dataset:
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, item: int) -> Dict[str, Any]:
-        index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        camera_id = self.parser.camera_ids[index]
-        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
-        params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
+    # def __getitem__(self, item: int) -> Dict[str, Any]:
+    #     index = self.indices[item]
+    #     image = imageio.imread(self.parser.image_paths[index])[..., :3]
+    #     camera_id = self.parser.camera_ids[index]
+    #     K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
+    #     params = self.parser.params_dict[camera_id]
+    #     camtoworlds = self.parser.camtoworlds[index]
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
-            mapx, mapy = (
-                self.parser.mapx_dict[camera_id],
-                self.parser.mapy_dict[camera_id],
-            )
-            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-            x, y, w, h = self.parser.roi_undist_dict[camera_id]
-            image = image[y : y + h, x : x + w]
+    #     if len(params) > 0:
+    #         # Images are distorted. Undistort them.
+    #         mapx, mapy = (
+    #             self.parser.mapx_dict[camera_id],
+    #             self.parser.mapy_dict[camera_id],
+    #         )
+    #         image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+    #         x, y, w, h = self.parser.roi_undist_dict[camera_id]
+    #         image = image[y : y + h, x : x + w]
 
-        if self.patch_size is not None:
-            # Random crop.
-            h, w = image.shape[:2]
-            x = np.random.randint(0, max(w - self.patch_size, 1))
-            y = np.random.randint(0, max(h - self.patch_size, 1))
-            image = image[y : y + self.patch_size, x : x + self.patch_size]
-            K[0, 2] -= x
-            K[1, 2] -= y
+    #     if self.patch_size is not None:
+    #         # Random crop.
+    #         h, w = image.shape[:2]
+    #         x = np.random.randint(0, max(w - self.patch_size, 1))
+    #         y = np.random.randint(0, max(h - self.patch_size, 1))
+    #         image = image[y : y + self.patch_size, x : x + self.patch_size]
+    #         K[0, 2] -= x
+    #         K[1, 2] -= y
 
-        data = {
-            "K": torch.from_numpy(K).float(),
-            "camtoworld": torch.from_numpy(camtoworlds).float(),
-            "image": torch.from_numpy(image).float(),
-            "image_id": item,  # the index of the image in the dataset
+    #     data = {
+    #         "K": torch.from_numpy(K).float(),
+    #         "camtoworld": torch.from_numpy(camtoworlds).float(),
+    #         "image": torch.from_numpy(image).float(),
+    #         "image_id": item,  # the index of the image in the dataset
+    #     }
+
+    #     if self.load_depths:
+    #         # projected points to image plane to get depths
+    #         worldtocams = np.linalg.inv(camtoworlds)
+    #         image_name = self.parser.image_names[index]
+    #         point_indices = self.parser.point_indices[image_name]
+    #         points_world = self.parser.points[point_indices]
+    #         points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+    #         points_proj = (K @ points_cam.T).T
+    #         points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+    #         depths = points_cam[:, 2]  # (M,)
+    #         if self.patch_size is not None:
+    #             points[:, 0] -= x
+    #             points[:, 1] -= y
+    #         # filter out points outside the image
+    #         selector = (
+    #             (points[:, 0] >= 0)
+    #             & (points[:, 0] < image.shape[1])
+    #             & (points[:, 1] >= 0)
+    #             & (points[:, 1] < image.shape[0])
+    #             & (depths > 0)
+    #         )
+    #         points = points[selector]
+    #         depths = depths[selector]
+    #         data["points"] = torch.from_numpy(points).float()
+    #         data["depths"] = torch.from_numpy(depths).float()
+
+    #     return data
+    def perpare_image(self, image, K):
+        # make sure in 512x384, 512x336, 512x288, 512x256, 512x160 otherwise resize then crop
+        h, w = image.shape[:2]
+        scale = 512 / w
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+        K[0, :] *= scale
+        K[1, :] *= scale
+        h, w = image.shape[:2]
+        if h not in [384, 336, 288, 256, 160]:
+            # pick nearest size
+            new_h = min([384, 336, 288, 256, 160], key=lambda x: abs(x - h))
+            # crop from center
+            image = image[(h - new_h) // 2 : (h + new_h) // 2, :, :]
+            K[1, 2] -= (h - new_h) // 2
+        return image, K
+
+    def __getitem__(self, index):
+        idx_1 = index
+        idx_2 = index + self.interval
+        idx_novel = index + self.interval // 2
+
+        image_1 = imageio.imread(self.parser.image_paths[idx_1])[..., :3]
+        image_2 = imageio.imread(self.parser.image_paths[idx_2])[..., :3]
+        image_novel = imageio.imread(self.parser.image_paths[idx_novel])[..., :3]
+
+        camera_id_1 = self.parser.camera_ids[idx_1]
+        camera_id_2 = self.parser.camera_ids[idx_2]
+        camera_id_novel = self.parser.camera_ids[idx_novel]
+
+        K_1 = self.parser.Ks_dict[camera_id_1].copy()
+        K_2 = self.parser.Ks_dict[camera_id_2].copy()
+        K_novel = self.parser.Ks_dict[camera_id_novel].copy()
+
+        # resize and crop
+        image_1, K_1 = self.perpare_image(image_1, K_1)
+        image_2, K_2 = self.perpare_image(image_2, K_2)
+        image_novel, K_novel = self.perpare_image(image_novel, K_novel)
+
+        # make sure in 512x384, 512x336, 512x288, 512x256, 512x160 otherwise crop
+
+        # params_1 = self.parser.params_dict[camera_id_1]
+        # params_2 = self.parser.params_dict[camera_id_2]
+        # params_novel = self.parser.params_dict[camera_id_novel]
+
+        camtoworlds_1 = self.parser.camtoworlds[idx_1]
+        camtoworlds_2 = self.parser.camtoworlds[idx_2]
+        camtoworlds_novel = self.parser.camtoworlds[idx_novel]
+
+        pts_map_1 = np.load(self.parser.point_map_paths[idx_1])
+        pts_map_2 = np.load(self.parser.point_map_paths[idx_2])
+        pts_map_novel = np.load(self.parser.point_map_paths[idx_novel])
+
+        item = {
+            "c2w_1": camtoworlds_1,
+            "c2w_2": camtoworlds_2,
+            "c2w_novel": camtoworlds_novel,
+            "img_1": image_1,
+            "img_2": image_2,
+            "img_novel": image_novel,
+            "K_1": K_1,
+            "K_2": K_2,
+            "K_novel": K_novel,
+            "pts3d_1": pts_map_1,
+            "pts3d_2": pts_map_2,
+            "pts3d_novel": pts_map_novel,
         }
-
-        if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
-            image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            if self.patch_size is not None:
-                points[:, 0] -= x
-                points[:, 1] -= y
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
-
-        return data
+        return item
 
 
 if __name__ == "__main__":

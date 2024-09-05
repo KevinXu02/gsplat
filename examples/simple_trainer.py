@@ -718,6 +718,8 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+        self.post_process()
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -883,6 +885,75 @@ class Runner:
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
+
+    @torch.no_grad()
+    def post_process(self):
+        # for each images, we need to render point map and store them in a folder
+        point_map_dir = f"{cfg.data_dir}/point_maps"
+        os.makedirs(point_map_dir, exist_ok=True)
+        for i, camera_id in enumerate(self.parser.camera_ids):
+            camtoworlds = self.parser.camtoworlds[i : i + 1]
+            K = self.parser.Ks_dict[camera_id]
+            width, height = self.parser.imsize_dict[camera_id]
+            # rescale max width to 512
+            scale = 512.0 / max(width, height)
+            width1, height1 = int(width * scale), int(height * scale)
+            # make sure in 512x384, 512x336, 512x288, 512x256, 512x160 otherwise crop
+            if height1 not in [384, 336, 288, 256, 160]:
+                # pick the closest one
+                height1 = min([384, 336, 288, 256, 160], key=lambda x: abs(x - height))
+                print("Crop height to", height1)
+            K = K * scale
+            # fix cx, cy
+            K[0, 2] = 512.0 / 2
+            K[1, 2] = height1 / 2
+            print(f"Camera {camera_id}: {width}x{height} -> {width1}x{height1}")
+
+            # raseterize splats
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=K[None],
+                width=width,
+                height=height,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
+                render_mode="RGB+D",
+            )  # [1, H, W, 4]
+            depth = renders[0, ..., 3:4]  # [H, W, 1]
+            # reproject depth to 3D points
+            points = depth_to_points(depth, K, camtoworlds[0], width, height)
+            # save points
+            points = points.cpu().numpy()
+            image_name = self.parser.image_names[i]
+            np.save(f"{point_map_dir}/{image_name}.npy", points)
+
+
+def depth_to_points(
+    depth: Tensor, K: Tensor, c2w: Tensor, width: int, height: int
+) -> Tensor:
+    """Reproject depth map to 3D points."""
+    # create grid
+    x = torch.linspace(0, width - 1, width, device=depth.device)
+    y = torch.linspace(0, height - 1, height, device=depth.device)
+    grid = torch.stack(torch.meshgrid(y, x), dim=-1)  # [H, W, 2]
+    grid = grid[None, ...].expand(depth.shape[0], -1, -1, -1)  # [1, H, W, 2]
+
+    # reproject
+    Kinv = torch.inverse(K)
+    points = torch.cat(
+        [
+            grid[..., 1:2] * depth,
+            grid[..., 0:1] * depth,
+            depth,
+            torch.ones_like(depth),
+        ],
+        dim=-1,
+    )  # [1, H, W, 4]
+    points = points.permute(0, 3, 1, 2)  # [1, 4, H, W]
+    points = torch.matmul(Kinv[None, None], points)  # [1, 3, H, W]
+    points = torch.matmul(c2w[:, :3, :3], points) + c2w[:, :3, 3:4]  # [1, 3, H, W]
+    return points.permute(0, 2, 3, 1).squeeze(0)  # [H, W, 3]
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
